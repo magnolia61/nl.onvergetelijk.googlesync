@@ -9,9 +9,12 @@
  * Deze functies vormen de directe brug naar Google. Ze zijn bewust eenvoudig gehouden:
  * één ding doen, foutmeldingen netjes teruggeven, geen sync-logica bevatten.
  *
- * Credentials: we hergebruiken de OAuth2-token die is opgeslagen door org.civicrm.googlegroups
- * (civicrm_setting 'googlegroups_settings'). Zo hoef je niet opnieuw te autoriseren.
- * De Google PHP client library is afkomstig uit de vendor-map van diezelfde extensie.
+ * Credentials: we hergebruiken de OAuth2-token die ooit is opgeslagen via org.civicrm.googlegroups
+ * (civicrm_setting 'googlegroups_settings'), maar lezen/schrijven die rechtstreeks via de
+ * Setting-API — geen dependency meer op de klassen van die extensie, dus werkt ook als
+ * die extensie disabled is. Zo hoef je niet opnieuw te autoriseren.
+ * De Google PHP client library is afkomstig uit de vendor-map van diezelfde extensie
+ * (puur een bestandspad, geen CiviCRM-hook — werkt dus ook als die extensie disabled is).
  *
  * Alle functies retourneren een resultaat-array met de sleutels:
  *   'success'  bool    TRUE als de API-call geslaagd is
@@ -84,19 +87,15 @@ function googlesync_get_client(): array {
     }
     include_once $vendor_autoload;
 
-    // Haal de opgeslagen OAuth2-instellingen op via de Utils-klasse van de officiële extensie.
-    // Als die klasse niet beschikbaar is, kunnen we ook rechtstreeks de setting ophalen.
-    if (!class_exists('CRM_Googlegroups_Utils')) {
-        $error = "CRM_Googlegroups_Utils niet beschikbaar. Is org.civicrm.googlegroups actief?";
-        wachthond($extdebug, 1, "### GOOGLESYNC ERROR: $error");
-        return ['success' => FALSE, 'client' => NULL, 'error' => $error];
-    }
-
+    // Haal de opgeslagen OAuth2-instellingen rechtstreeks op via de Setting-API. Dit is
+    // dezelfde civicrm_setting ('googlegroups_settings') die org.civicrm.googlegroups
+    // gebruikt, maar we lezen 'm direct — zo blijven we werken ongeacht of die extensie
+    // actief is (haar CRM_Googlegroups_Utils-klasse laadt anders niet).
     $params_setting_get = [
-        'checkPermissions' => FALSE,
+        'name' => 'googlegroups_settings',
     ];
-    wachthond($extdebug, 7, 'params_setting_get (via CRM_Googlegroups_Utils::getSettings)', $params_setting_get);
-    $settings = CRM_Googlegroups_Utils::getSettings();
+    wachthond($extdebug, 7, 'params_setting_get', $params_setting_get);
+    $settings = civicrm_api3('Setting', 'getvalue', $params_setting_get);
     wachthond($extdebug, 9, 'settings (gefilterd — geen secrets in log)', [
         'client_id_aanwezig'      => !empty($settings['client_id']),
         'client_secret_aanwezig'  => !empty($settings['client_secret']),
@@ -133,7 +132,10 @@ function googlesync_get_client(): array {
         $error = "Google access token verlopen en kan niet worden ververst. Her-autorisatie vereist.";
         wachthond($extdebug, 1, "### GOOGLESYNC ERROR: $error");
         // Wis het verlopen token zodat de admin op de settingspagina ziet dat her-autorisatie nodig is.
-        CRM_Googlegroups_Utils::setAccessToken('');
+        // (Zelfde logica als CRM_Googlegroups_Utils::setSettings(), maar zonder klasse-afhankelijkheid.)
+        civicrm_api3('Setting', 'create', [
+            'googlegroups_settings' => array_merge($settings, ['access_token' => '']),
+        ]);
         return ['success' => FALSE, 'client' => NULL, 'error' => $error];
     }
 
@@ -313,11 +315,10 @@ function googlesync_deletemember(string $google_group_id, array $emails): array 
 /**
  * Haalt de huidige ledenlijst op van één Google Group.
  *
- * BEWUSTE KEUZE: We hergebruiken hier de officiële API van org.civicrm.googlegroups
- * (civicrm_api3('Googlegroups', 'getmembers', ...)). Die functie is read-only, doet
- * de paginatie al netjes, en is stabiel. We hoeven het wiel dus niet opnieuw uit te
- * vinden — alleen de onbetrouwbare schrijf-acties (subscribe/deletemember) hebben we
- * in een eigen robuuste implementatie gegoten.
+ * Gebruikt dezelfde gedeelde client als subscribe/deletemember (googlesync_get_client()),
+ * met paginatie via members->listMembers(). Voorheen liep dit via de API van
+ * org.civicrm.googlegroups; die is overgenomen zodat deze extensie niet meer afhankelijk
+ * is van het actief zijn van die extensie.
  *
  * De debug-logging is GEKNIPT via _googlesync_clip(): een groep kan honderden leden
  * hebben en die willen we niet integraal in de logs zien.
@@ -334,34 +335,34 @@ function googlesync_getmembers(string $google_group_id): array {
     wachthond($extdebug, 1, "### GOOGLESYNC 4.0 GETMEMBERS",                             "[$google_group_id]");
     wachthond($extdebug, 2, "########################################################################");
 
-    // Roep de officiële Googlegroups API aan. Deze regelt zelf client, token en paginatie.
-    $params_googlegroups_getmembers = [
-        'group_id' => $google_group_id,
-    ];
-    wachthond($extdebug, 7, 'params_googlegroups_getmembers', $params_googlegroups_getmembers);
+    $client_result = googlesync_get_client();
+    if (!$client_result['success']) {
+        return ['success' => FALSE, 'data' => [], 'error' => $client_result['error']];
+    }
+    $client = $client_result['client'];
+
+    $members = [];
 
     try {
-        // @ onderdrukt PHP-warnings uit de Google-library; fouten vangen we via is_error af.
-        $result_googlegroups_getmembers = @civicrm_api3('Googlegroups', 'getmembers', $params_googlegroups_getmembers);
+        $service    = new Google_Service_Directory($client);
+        $page_token = '';
+        do {
+            $opt_params = ['pageToken' => $page_token];
+            wachthond($extdebug, 7, 'opt_params listMembers', $opt_params);
+            $results = $service->members->listMembers($google_group_id, $opt_params);
+            foreach ($results->getMembers() as $result) {
+                $members[$result['id']] = $result['email'];
+            }
+            $page_token = $results->nextPageToken;
+        } while ($page_token);
     } catch (\Throwable $e) {
         $error = "GOOGLESYNC getmembers fout voor group $google_group_id: " . $e->getMessage();
         wachthond($extdebug, 1, "### GOOGLESYNC ERROR", $error);
         return ['success' => FALSE, 'data' => [], 'error' => $error];
     }
 
-    // De officiële API geeft bij een fout een gestructureerde error-array terug.
-    if (!empty($result_googlegroups_getmembers['is_error'])) {
-        $error = "GOOGLESYNC getmembers API-fout voor group $google_group_id: "
-               . ($result_googlegroups_getmembers['error_message'] ?? 'onbekend');
-        wachthond($extdebug, 1, "### GOOGLESYNC ERROR", $error);
-        return ['success' => FALSE, 'data' => [], 'error' => $error];
-    }
-
-    // 'values' bevat [member_id => email].
-    $members = $result_googlegroups_getmembers['values'] ?? [];
-
     // GEKNIPTE debug: alleen totaal + een sample, niet de hele ledenlijst.
-    wachthond($extdebug, 9, 'result_googlegroups_getmembers (geknipt)', _googlesync_clip($members));
+    wachthond($extdebug, 9, 'members (geknipt)', _googlesync_clip($members));
 
     wachthond($extdebug, 1, "### GOOGLESYNC 4.0 GETMEMBERS",                             "[OK]");
 
@@ -379,8 +380,10 @@ function googlesync_getmembers(string $google_group_id): array {
  * gekoppeld is om te syncen. Voor die laatste, zie googlesync_get_configured_groups()
  * in googlesync.kampdata.php.
  *
- * We hergebruiken ook hier de officiële API (civicrm_api3('Googlegroups', 'getgroups')),
- * die zelf over de domeinen en paginatie heen loopt.
+ * Gebruikt dezelfde gedeelde client als de andere functies; de domeinlijst komt uit
+ * dezelfde 'googlegroups_settings' (key 'domains'). Voorheen liep dit via de API van
+ * org.civicrm.googlegroups; die is overgenomen zodat deze extensie niet meer afhankelijk
+ * is van het actief zijn van die extensie.
  *
  * Retourneert een map van [google_group_id => 'domein:naam::email'].
  *
@@ -394,30 +397,40 @@ function googlesync_getgroups(): array {
     wachthond($extdebug, 1, "### GOOGLESYNC 5.0 GETGROUPS",                              "[START]");
     wachthond($extdebug, 2, "########################################################################");
 
-    // De officiële API verwacht geen verplichte params; domeinen komen uit de settings.
-    $params_googlegroups_getgroups = [];
-    wachthond($extdebug, 7, 'params_googlegroups_getgroups', $params_googlegroups_getgroups);
+    $client_result = googlesync_get_client();
+    if (!$client_result['success']) {
+        return ['success' => FALSE, 'data' => [], 'error' => $client_result['error']];
+    }
+    $client = $client_result['client'];
+
+    $settings = civicrm_api3('Setting', 'getvalue', ['name' => 'googlegroups_settings']);
+    $domains  = $settings['domains'] ?? [];
+    wachthond($extdebug, 7, 'domains', $domains);
+
+    $groups = [];
 
     try {
-        $result_googlegroups_getgroups = @civicrm_api3('Googlegroups', 'getgroups', $params_googlegroups_getgroups);
+        $service = new Google_Service_Directory($client);
+        foreach ($domains as $domain) {
+            $page_token = '';
+            do {
+                $opt_params = ['domain' => trim($domain), 'pageToken' => $page_token];
+                wachthond($extdebug, 7, 'opt_params listGroups', $opt_params);
+                $results = $service->groups->listGroups($opt_params);
+                foreach ($results->getGroups() as $result) {
+                    $groups[$result['id']] = "{$domain}:{$result['name']}::{$result['email']}";
+                }
+                $page_token = $results->nextPageToken;
+            } while ($page_token);
+        }
     } catch (\Throwable $e) {
         $error = "GOOGLESYNC getgroups fout: " . $e->getMessage();
         wachthond($extdebug, 1, "### GOOGLESYNC ERROR", $error);
         return ['success' => FALSE, 'data' => [], 'error' => $error];
     }
 
-    if (!empty($result_googlegroups_getgroups['is_error'])) {
-        $error = "GOOGLESYNC getgroups API-fout: "
-               . ($result_googlegroups_getgroups['error_message'] ?? 'onbekend');
-        wachthond($extdebug, 1, "### GOOGLESYNC ERROR", $error);
-        return ['success' => FALSE, 'data' => [], 'error' => $error];
-    }
-
-    // 'values' bevat [group_id => 'domein:naam::email'].
-    $groups = $result_googlegroups_getgroups['values'] ?? [];
-
     // GEKNIPTE debug: er kunnen tientallen/honderden groepen zijn.
-    wachthond($extdebug, 9, 'result_googlegroups_getgroups (geknipt)', _googlesync_clip($groups));
+    wachthond($extdebug, 9, 'groups (geknipt)', _googlesync_clip($groups));
 
     wachthond($extdebug, 1, "### GOOGLESYNC 5.0 GETGROUPS",                              "[OK]");
 

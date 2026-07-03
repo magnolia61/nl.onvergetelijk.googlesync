@@ -485,6 +485,10 @@ function googlesync_sync_configured(array $whitelist = [], bool $dry_run = FALSE
             $civicrm_emails = _googlesync_apply_kampmailbox($civicrm_emails, strtolower($m[2]), 'notif_' . strtolower($m[1]));
         }
 
+        // Contact-specifieke e-mail-overrides (bijv. Daniël Fritschij op de hoofdkeuken-*
+        // groepen: @onvergetelijk.nl i.p.v. zijn primaire persoonlijke adres).
+        $civicrm_emails = _googlesync_apply_contact_email_overrides($civicrm_emails, $civi_group_id);
+
         wachthond($extdebug, 3, 'civicrm_emails (geknipt)', _googlesync_clip($civicrm_emails));
 
         // 3. Diff toepassen.
@@ -629,6 +633,89 @@ function _googlesync_apply_kampmailbox(array $emails, string $kampkort, string $
     }
 
     return $emails;
+}
+
+/**
+ * (Intern) Contact-specifieke e-mail-overrides: voor bepaalde combinaties van
+ * CiviCRM-groep + contact gebruiken we een ANDER adres dan het primaire adres dat
+ * _googlesync_primary_emails() zou opleveren. Handig als iemand voor één specifieke
+ * rol een apart (bijv. functioneel) adres moet gebruiken, zonder zijn CiviCRM-brede
+ * primaire e-mail te wijzigen.
+ *
+ * @return array  [civi_group_id => [contact_id => override e-mailadres]]
+ */
+function _googlesync_contact_email_overrides(): array {
+    return [
+        // Daniël Fritschij: hoofdkeuken-* [ACL] (kk1/kk2/bk1/bk2/tk1/tk2/jk1/jk2/top).
+        // Voor deze groepen specifiek zijn @onvergetelijk.nl-adres i.p.v. zijn
+        // primaire (persoonlijke gmail) adres.
+        1675 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1676 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1677 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1678 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1679 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1680 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1681 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1682 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+        1683 => [19210 => 'daniel.fritschij@onvergetelijk.nl'],
+    ];
+}
+
+/**
+ * (Intern) Past de contact-specifieke e-mail-overrides toe op een resultaatlijst van
+ * googlesync_get_group_emails(). Verwijdert het primaire adres van de betreffende
+ * contactpersoon (indien aanwezig) en voegt het override-adres toe — maar ALLEEN als
+ * de contactpersoon daadwerkelijk actief lid is van deze groep.
+ *
+ * @param array $emails         Resultaat van googlesync_get_group_emails()
+ * @param int   $civi_group_id  CiviCRM group ID
+ *
+ * @return array  Aangepaste e-maillijst
+ */
+function _googlesync_apply_contact_email_overrides(array $emails, int $civi_group_id): array {
+
+    $extdebug  = 'googlesync.sync';
+    $overrides = _googlesync_contact_email_overrides()[$civi_group_id] ?? [];
+
+    if (empty($overrides)) {
+        return $emails;
+    }
+
+    foreach ($overrides as $contact_id => $override_email) {
+
+        // Alleen toepassen als de contactpersoon daadwerkelijk actief lid is van deze groep.
+        $is_member = (bool) civicrm_api4('GroupContact', 'get', [
+            'checkPermissions' => FALSE,
+            'select'           => ['id'],
+            'where'            => [
+                ['group_id',   '=', $civi_group_id],
+                ['contact_id', '=', $contact_id],
+                ['status',     '=', 'Added'],
+            ],
+            'limit' => 1,
+        ])->count();
+
+        if (!$is_member) {
+            continue;
+        }
+
+        $override_email = strtolower($override_email);
+
+        // Verwijder het primaire adres van deze contactpersoon uit de lijst (indien aanwezig).
+        foreach (_googlesync_primary_emails([$contact_id]) as $primary_email) {
+            $key = array_search($primary_email, $emails, TRUE);
+            if ($key !== FALSE) {
+                unset($emails[$key]);
+            }
+        }
+
+        if (!in_array($override_email, $emails, TRUE)) {
+            $emails[] = $override_email;
+            wachthond($extdebug, 3, "e-mail-override toegepast [group $civi_group_id][contact $contact_id]", $override_email);
+        }
+    }
+
+    return array_values($emails);
 }
 
 // =======================================================================================
