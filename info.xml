@@ -21,6 +21,9 @@
     <ver>6.14</ver>
   </compatibility>
   <comments>Onderdeel van de Onvergetelijk-extensie-suite voor Stichting Onvergetelijke Zomerkampen. Eigen implementatie van Google Groups-sync (vervangt het vertrouwen op org.civicrm.googlegroups voor de sync-logica). Compatibel met CiviCRM 6.14, PHP 8.4 en Smarty 5.</comments>
+  <requires>
+    <ext>nl.onvergetelijk.base</ext>
+  </requires>
   <classloader>
     <psr0 prefix="CRM_" path="."/>
     <psr4 prefix="Civi\" path="Civi"/>
